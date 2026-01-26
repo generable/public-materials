@@ -1,0 +1,173 @@
+---
+author: "Nikolas Siccha"
+lightbox: true
+html:
+  page-layout: full
+  toc: true 
+  embed-resources: false
+  number-sections: true
+title: "Divergent transitions in Hilbert Space Gaussian process posteriors and how to avoid them"
+subtitle: "How to train your favorite basis function based approximation to Gaussian Processes."
+bibliography: references.bib
+filters:
+   - include-code-files
+---
+
+
+This builds on research done while in Aki Vehtari's group at Aalto University, Finland, and is the continuation of a previous blog post, i.e. ["Nonparametric statistics: Gaussian processes and their approximations"](https://www.generable.com/post/nonparametric-statistics-gaussian-processes-and-their-approximations). This blog post will look at the same dataset and essentially the same model as the previous one, and present a way to maintain much of the promised scalability of Hilbert Space Gaussian Processes (HSGPs), a basis function based approximation to exact Gaussian processes (GPs). Julia (@bezanson_julia_2017) and Stan (@carpenter_stan_2017) code is available at [https://github.com/generable/public-materials](https://github.com/generable/public-materials) under `blog/hsgp-reparam`.
+
+## HSGP primer {#sec-HSGP}
+
+HSGPs approximate (non-periodic and 1D in this example) functions $f(x)$ with GP priors via weighted decompositions into mutually orthogonal sine basis functions, i.e.
+
+$$
+f(x) \approx \frac{1}{L}\sum_{i=1}^m w_i\sin\left(\frac{\pi i}{2L}(\xi(x)+L)\right),
+$$
+
+where $L > 1$ is a discretization parameter, 
+$i = 1, \dots, m$ is the basis function number, $m$ is the total number of basis functions,
+$w_i$ is the weight of the $i$-th basis function (the key unknown parameters), 
+$\xi(x)$ linearly maps $x$ onto $[-1, +1]$, see e.g. @riutort-mayol_practical_2022 or @solin_hilbert_2020 for more details.
+The unknown basis function weights have zero-mean normal priors which depend strongly on the GP hyperparameters, i.e. 
+
+$$
+w_i \sim \mathrm{normal}(0, \sigma^2_\mathrm{GP}\sigma^2_w(\ell_\mathrm{GP}, i)),
+$$
+where $\sigma^2_\mathrm{GP}$ is the marginal variance of the GP, $\ell_\mathrm{GP}$ is its length scale, and $\sigma^2_w(\ell_\mathrm{GP}, i)$ is a kernel dependent function. See @fig-hsgp_viz for a visualization of the basis functions and the dependence of their prior scales on the GP length scale and the basis function number for the used squared exponential kernel.
+
+While this decomposition allows to frontload much of the computational work and to evaluate the approximated function $f(x)$ at $(x_1, \dots, x_n)$ in linear time both in the number of basis functions $m$ and the number of points $n$, the HSGP approximation often gives rise to a posterior geometry which makes the posterior difficult to sample from with standard Markov chain Monte Carlo (MCMC) samplers like the No-U-Turn-Sampler (NUTS). Crucially, as for standard hierarchical models, sampling from HSGP posteriors with standard tools is not as easy as "implement the model once and easily sample from the posteriors due to arbitrary datasets" - instead, different datasets will give rise to different posterior geometries, and will have to be handled differently.
+ 
+{{< include _figs/hsgp_viz.md >}}
+
+## HSGP motorcycle posterior 
+
+{{< include _figs/hsgp_posterior.md >}}
+
+To keep things interesting, we will look again at the heteroscedastic GP model from the previous blog post, 
+i.e. $y \sim \mathrm{normal}(\mu(x), \exp(\eta(x)))$, $\mu \sim \mathrm{GP}(0, k_\mu)$, and $\eta \sim \mathrm{GP}(0, k_\eta)$ with "appropriate" GP hyperparameter priors (see @sec-nc-impl for the model implementation), conditioned on the 
+[R `mcycle` dataset, i.e.  acceleration data from a simulated motorcycle accident](https://search.r-project.org/CRAN/refmans/VarReg/html/mcycle.html), see @fig-hsgp_posterior for a visualization of the data and the posterior. Similar difficulties are present for easier models such as the corresponding homoscedastic GP model, or more standard hierarchical models, see @sec-homoscedastic in the appendix.
+
+Sampling 10,000 draws using a single chain from that posterior using "Julia's NUTS" implementation results in a respectable minimal effective sample size (1500), a moderately high average number of leapfrog steps per transition (270), but also a worryingly high fraction of divergent transitions (123 out of 10,000). These divergent transitions are a warning sign indicating potentially inadequate exploration of the posterior in question, and generally show up whenever the posterior exhibits strongly varying local scales. More specifically, they occur whenever the step size of the numerical integrator used by NUTS is too large for parts of the posterior, leading to large Hamiltonian (i.e. total energy) errors and thus to "premature" termination of NUTS' recursive subtree extension. 
+
+Two commonly recommended solutions to this problem of divergent transitions are to reparametrize the model (e.g. switch from a centered parametrization to a non-centered parametrization or vice versa), or to increase the adaptation's target "acceptance rate" (a slightly misnamed statistic of individual NUTS trajectories) leading to smaller sampling step sizes.
+Indeed, sometimes finding this good enough parametrization can be easy (e.g. use a centered parametrization for subjects which have a lot of data informing their parameters and use a non-centered parametrization for the ones with little data) and sometimes just waiting "a bit longer" can be feasible.
+Generally however, finding a "good enough" parametrization can vary wildly in difficulty, and "just" increasing the target acceptance rate is equivalent to throwing more compute at the problem and hoping it goes away - which it might not do. 
+
+## Monolithic non-centered or centered HSGP basis function weights parametrization 
+
+So, what even is the problem for this posterior? This is after all no classical hierarchical model, where the issue of a centered or non-centered parametrization directly comes to mind. In fact, there are no "standard" location and scale parameters $\mu$ and $\sigma$ and corresponding hierarchical parameters 
+$$x_1, \dots, x_n \sim \mathrm{normal}(\mu, \sigma^2).$$ 
+Instead, we have our GP hyperparameters, i.e. the marginal variances $\sigma^2_\mathrm{GP}$ and the length scales $\ell_\mathrm{GP}$ of the two GPs, which, as seen in @sec-HSGP determine the priors on the basis function weights via
+
+$$
+w_i \sim \mathrm{normal}(0, \sigma^2_\mathrm{GP}\sigma^2_w(\ell_\mathrm{GP}, i)),
+$$
+with (for the used squared exponential kernel)
+$$
+\log(\sigma_w(\ell_\mathrm{GP}, i)) = -\left(\frac{\pi i\ell_\mathrm{GP}}{4L}\right)^2 + \frac{\log(\sqrt{2\pi}\ell_\mathrm{GP})}{2},
+$$
+**which in fact is more problematic than for the standard hierarchical model** as it introduces a much stronger nonlinear dependency between the weight parameters and the hyperparameters. For the sampler, it's an (in the common worst case) double exponential dependence between $\log(\ell_\mathrm{GP})$, the natural "unconstrained"/sampler parametrization of the length scale, and the prior scale $\sigma_w(\ell_\mathrm{GP}, i)$.
+
+To make things worse, the dependence between the GP length scales and the prior scales additionally depends not only on the GPs marginal standard deviation, but also on the basis function number, with the prior scales for higher frequency basis functions depending more strongly on the GP length scales. And finally, in the HSGP setting we are not in the privileged position of the classical hierarchical model of being able to (easily) identify individual weights/parameters with subsets of the data, as all basis functions will couple equally strongly with "all" observations due to the global nature of the basis functions. Generally, it should be such that higher-frequency basis functions will be less strongly identified, while lower-frequency basis function will be more strongly identified, but that's about all that can generally be said a priori.
+
+As the conclusion of this section, see @fig-unit_scatter and @fig-centered_scatter, visualizing the posterior dependence of a few basis function weights on the GP hyperparameters for the fully non-centered (@fig-unit_scatter) and fully centered (@fig-centered_scatter) parametrization. For both parametrizations, "nonlinear geometries" (i.e. funnels) are visible for some of the basis function weights, as is the usual "sticky" behavior of samples near problematic regions (the "lone" dots visible in the scatter plots).
+    
+{{< include _figs/unit_scatter.md >}}
+    
+{{< include _figs/centered_scatter.md >}}
+
+## Adaptive HSGP basis function weights parametrization 
+
+There has been previous work on the problem of adaptive reparametrizations, including adaptive partial centering, 
+with the main reference being @gorinova_automatic_2020. The main drawback of that method is maybe that it requires the model to be able 
+to do Variational Inference (VI) on the model and parametrization parameters, something that does not come for free for Stan models.
+Briefly, the idea of @gorinova_automatic_2020 is to minimize the KL-divergence $$D_\mathrm{KL}(P || Q) \approx \frac{1}{S}\sum_{s=1}^S\log p(\theta_s) - \log q(\theta_s)$$ of the (reparametrized) posterior $P$ from a (normal) approximation $Q$,
+which has been convincingly proven to work very well whenever VI works well enough, which it does quite often.
+
+The natural alternative to minimizing the KL-divergence $D_\mathrm{KL}(P || Q)$ of the reparametrized posterior $P$ from a normal approximation $Q$ is just going the other direction,
+i.e. minimizing the KL-divergence $D_\mathrm{KL}(Q || P)$ of a normal approximation $Q$ from the reparametrized posterior $P$. If the first option is asking "how can we make a normal distribution look as much as possible like the posterior", then the second option is asking "how can we make the posterior look as much as possible like a normal distribution", which intuitively seems to be the same question, but has a slightly different answer and also a very different way of being answered.
+
+The main difference between the two options is the samples that are used. In the first option, which we will refer to as the VI-method, we are using samples from the normal approximate distributions to minimize the loss function and find good parametrization parameters, while in the second option, which we will refer to as the MCMC-method, we are using samples from the posterior to minimize the loss function and find good parametrization parameters. Naturally, for the MCMC-method we have the same chicken-and-egg problem as for the learning of the posterior scales (aka as learning of the mass matrix) - without a good guess of the scales (i.e. linear parametrization parameters) or nonlinear parametrization parameters, sampling from the posterior is difficult, but we need good samples from the posterior to obtain a good guess of the linear and nonlinear parametrization parameters.
+
+While this does complicate everything and makes it difficult to have an efficient and robust implementation of the MCMC-method, there's still hope to have something that works reasonably well and efficiently. 
+In the end, the adaptive reparametrization doesn't have to be perfect to already help a lot, it just needs to be good enough, and any remaining "imperfactions" in the posterior geometry will have to be solved for better or worse by downstream methods, i.e. by better samplers or by actually using more (but hopefully less than otherwise) compute.
+
+Finally, there are a few ways in which the maths conspire to make the adaptive reparametrization MCMC-method easier to implement and use than could be reasonably expected a priori. Without going into further details here, these are:
+
+* Generally and for "standard" reparametrizations, the "big" (joint) optimization problem decouples into many separate, low-dimensional ones, which are easy to solve separately.
+* For each of these separate optimization problems, there is no need to compute anything but the transformed parameters given a candidate parametrization and the jacobian adjustment associated with that reparametrization. 
+* Given a fixed candidate parametrization, the loss function can be computed "online", i.e. without holding on to all of the draws that go into the computation of the loss.
+
+Please see @sec-loss-impl for a Julia implementation of the loss function for the "standard" partially centered parametrization (with zero-mean) of a single hierarchical parameter $w_{(1)}$, i.e. the (re)parametrization
+$$
+w_{(c)} = w_{(0)} \sigma^c \text{ with } w_{(1)} \sim \mathrm{normal}(0, \sigma) \iff w_{(0)} \sim \mathrm{normal}(0, 1).
+$$ 
+
+Finally, please see @fig-loss_profile for a visualization of the loss profiles of the MCMC-method for some of the basis function weight parametrizations, @fig-wave_profile for a visualization of the dependence of the optimized partial centeredness on the basis function number (i.e. frequency), @fig-ahsgp_posterior for a visualization of the original posterior (as in @fig-hsgp_posterior) sampled anew using the optimized parametrization, and @fig-adaptive_scatter for a visualization of the much reduced dependence of the basis function weight parameters on the GP hyperparameters.
+
+Sampling with the optimized parametrization had generally better but not perfect characteristics, 
+specifically we ended up with a higher minimal effective sample (1900 vs 1500), needed fewer average number of leapfrog steps (43 vs 270) and had fewer divergent transitions (35 vs 123 out of 10,000). See also @sec-sampling for a more in-depth comparison.
+
+{{< include _figs/loss_profile.md >}}
+    
+{{< include _figs/wave_profile.md >}}
+    
+{{< include _figs/ahsgp_posterior.md >}}
+
+{{< include _figs/adaptive_scatter.md >}} 
+
+### Summary and disclaimers
+
+For this particular set-up we have seen a manifold improvement of sampling efficiency after reparametrization. However, while the reparametrization itself (i.e. parametrization parameters optimization and potentially a transformation of samples) has almost negligible cost, being able to do this reparametrization reliably required us to do an initial sampling run. In principle, it's possible to combine standard warm-up procedures (which usually learn linear parametrization parameters - the mass matrix) with this optimization of nonlinear parametrization parameters, but doing this both efficiently and reliably in general way is not straightforward.
+
+As done in [a previous blog post](https://www.generable.com/post/lloqs), some of the free parameters of this case study have been tuned (slightly) to make for a more interesting story and prettier pictures. However, as before, this does not mean that the method presented here is not very often relevant and helpful - in fact, it almost always is. As a matter of fact, the method presented here should (in my opinion) be a standard tool whenever the prior scales of one set of parameters depends on another set of parameters - that is for almost any model. The main drawbacks of the presented method are a) it's not perfect (but it can help a lot), and b) it requires (minimal) manual effort, both in adapting (Stan) models and in adding some postprocessing to do the reparametrization (something which was handled in a better way in @gorinova_automatic_2020).
+
+Finally, a word of caution regarding the use of partially centered parametrizations for HSGP models: Due to the double exponential decay of the basis function weight prior scales, the non-centered parametrization is the only parametrization which does not sometimes-to-often struggle with numerical issues during initialization or sampling. This is because if the basis function weight prior scales underflow to zero, there is no issue for the non-centered parametrization which will just read $w_{(0)} \sim(0, 1); w_{(1)} = 0 w_{(0)}$, but for any partially or fully centered parametrization, which would read $w_{(c)} \sim(0, 0^c); w_{(1)} = 0 w_{(c)}$, evaluation the prior log density of $w_{(c)}$ will return negative infinity and cause a divergence.
+
+### References {.unnumbered}
+
+::: {#refs}
+:::
+
+## Appendix
+
+### Loss function Julia implementation {.appendix #sec-loss-impl}
+
+```{.julia include="main.jl" snippet="loss_function"}
+```
+
+### Standard (non-centered) HSGP Stan implementation {.appendix #sec-nc-impl}
+
+```{.stan include="stan/mcyclex.stan"}
+```
+
+### Partially centered HSGP Stan implementation {.appendix #sec-pc-impl}
+
+```{.stan include="stan/adaptive_mcyclex.stan"}
+```
+
+### Sampling statistics comparison (heteroscedastic model) {.appendix #sec-sampling}
+
+In the main text, we report sampling statistics for a single long chain with a target acceptance rate of 0.8. @tbl-heteroscedastic-sampling below reports the same sampling statistics for 40 chains sampling from the heteroscedastic model for varying target acceptance rates (0.8, 0.9 and 0.99).
+
+{{< include _figs/heteroscedastic-sampling.md >}} 
+
+### Sampling statistics comparison (homoscedastic model) {.appendix #sec-homoscedastic}
+
+In the main text, we report sampling statistics for a single long chain for the heteroscedastic model. @tbl-homoscedastic-sampling below reports the same sampling statistics for 40 chains sampling from the homoscedastic model for varying target acceptance rates (0.8, 0.9 and 0.99). Generally, due to coupling between the two GPs, sampling from the heteroscedastic model will be more difficult than sampling from the homoscedastic one. Sampling from the homoscedastic model on the other hand will generally be more difficult than sampling from "standard" hierarchical models without shrinkage priors, as the dependence of the prior scales on the GP hyperparameters will usually be stronger. On the other hand, shrinkage priors often lead to even more difficult posterior geometries, because there's a potentially even stronger interaction between and within different parameter "levels" of the model.
+
+{{< include _figs/homoscedastic-sampling.md >}} 
+
+For sake of completeness, the two homoscedastic models are also reproduced below.
+
+
+### Standard (non-centered) HSGP Stan homoscedastic model implementation {.appendix #sec-nc-homo-impl}
+
+```{.stan include="stan/mcycle10x.stan"}
+```
+
+### Partially centered HSGP Stan homoscedastic model implementation {.appendix #sec-pc-homo-impl}
+
+```{.stan include="stan/adaptive_mcycle10x.stan"}
+```
+ 
